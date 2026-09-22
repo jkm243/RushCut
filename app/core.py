@@ -1,16 +1,76 @@
 # -*- coding: utf-8 -*-
 """
 RushCut - Moteur de traitement local (100% hors ligne)
-Fonctions : suppression de silences, détection de beats,
-amélioration vocale, accélération pitch-préservé.
+ffmpeg est localisé automatiquement, ou téléchargé/installé au 1er lancement.
 """
-import subprocess, re, os, shutil, csv, io
+import subprocess, re, os, sys, shutil, csv, zipfile, urllib.request
 import numpy as np
 
-FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+LOCAL_DIR  = os.path.join(os.path.expanduser("~"), ".rushcut")
+
+def _candidate_dirs():
+    dirs = []
+    meipass = getattr(sys, "_MEIPASS", None)          # PyInstaller onefile
+    if meipass:
+        dirs.append(meipass)
+    dirs.append(os.path.dirname(os.path.abspath(sys.argv[0])))  # dossier de l'exe
+    dirs.append(LOCAL_DIR)                                      # ~/.rushcut
+    dirs.append(os.path.dirname(os.path.abspath(__file__)))     # dossier du script
+    return dirs
+
+def _find_ffmpeg():
+    for d in _candidate_dirs():
+        for name in ("ffmpeg.exe", "ffmpeg"):
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return p
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    return None
+
+def _download_hook(log):
+    last = [0]
+    def hook(blocknum, blocksize, totalsize):
+        pct = int(blocknum * blocksize * 100 / max(totalsize, 1))
+        if pct - last[0] >= 10:
+            last[0] = pct
+            log(f"  Téléchargement ffmpeg : {min(pct,100)}%")
+    return hook
+
+def ensure_ffmpeg(log=print):
+    """Trouve ffmpeg, sinon le télécharge et l'installe automatiquement."""
+    global FFMPEG
+    p = _find_ffmpeg()
+    if p:
+        FFMPEG = p
+        log("✔ ffmpeg trouvé : " + p)
+        return p
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    zip_path = os.path.join(LOCAL_DIR, "ffmpeg.zip")
+    log("ffmpeg absent → téléchargement automatique (environ 80 Mo, une seule fois)...")
+    urllib.request.urlretrieve(FFMPEG_URL, zip_path, _download_hook(log))
+    log("  Extraction...")
+    with zipfile.ZipFile(zip_path) as z:
+        for n in z.namelist():
+            if n.replace("\\", "/").endswith("/bin/ffmpeg.exe") or n.endswith("/bin/ffmpeg"):
+                with z.open(n) as src, open(os.path.join(LOCAL_DIR, "ffmpeg.exe"), "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                break
+    os.remove(zip_path)
+    p = _find_ffmpeg()
+    if not p:
+        raise RuntimeError(
+            "Installation de ffmpeg impossible.\n"
+            "Installe-le manuellement : https://www.gyan.dev/ffmpeg/builds/")
+    FFMPEG = p
+    log("✔ ffmpeg installé automatiquement.")
+    return p
+
+FFMPEG = _find_ffmpeg() or "ffmpeg"
 
 def _run(cmd, capture=False):
-    """Exécute une commande ffmpeg et retourne (returncode, stderr)."""
     p = subprocess.run(cmd, stdout=subprocess.PIPE if capture else None,
                        stderr=subprocess.PIPE, text=True)
     return p.returncode, p.stderr or ""
@@ -23,7 +83,6 @@ def has_audio(path):
 # 1. SUPPRESSION DES SILENCES (Voice Cut)
 # ------------------------------------------------------------------
 def detect_silences(path, threshold_db=-35.0, min_dur=0.5):
-    """Retourne la liste des segments de silence (start, end)."""
     cmd = [FFMPEG, "-i", path, "-af",
            f"silencedetect=n={threshold_db}dB:d={min_dur}", "-f", "null", "-"]
     _, err = _run(cmd, capture=True)
@@ -32,7 +91,6 @@ def detect_silences(path, threshold_db=-35.0, min_dur=0.5):
     return list(zip(starts, ends[:len(starts)]))
 
 def keep_segments(duration, silences, padding=0.08):
-    """Convertit les silences en segments à GARDER, avec padding."""
     segs, cur = [], 0.0
     for s, e in silences:
         s2, e2 = max(0.0, s - padding), e + padding
@@ -44,8 +102,7 @@ def keep_segments(duration, silences, padding=0.08):
     return [(a, b) for a, b in segs if b - a > 0.05]
 
 def get_duration(path):
-    cmd = [FFMPEG, "-i", path, "-f", "null", "-"]
-    _, err = _run(cmd, capture=True)
+    _, err = _run([FFMPEG, "-i", path, "-f", "null", "-"], capture=True)
     m = re.findall(r"time=(\d+):(\d+):([\d.]+)", err)
     if m:
         h, mn, s = m[-1]
@@ -54,7 +111,6 @@ def get_duration(path):
 
 def remove_silences(input_path, output_path, threshold_db=-35.0,
                     min_dur=0.5, padding=0.08, log=print):
-    """Découpe audio+vidéo en supprimant les silences."""
     if not has_audio(input_path):
         log("! Aucune piste audio : copie simple du fichier.")
         shutil.copy(input_path, output_path)
@@ -78,16 +134,12 @@ def remove_silences(input_path, output_path, threshold_db=-35.0,
            "-c:a", "aac", "-b:a", "192k", output_path]
     log("  Ré-encodage en cours...")
     rc, err = _run(cmd, capture=True)
-    if rc != 0:
-        log("! Erreur ffmpeg : " + err[-500:])
-    else:
-        log(f"  OK → {output_path}")
+    log("  OK → " + output_path if rc == 0 else "! Erreur ffmpeg : " + err[-500:])
 
 # ------------------------------------------------------------------
-# 2. DÉTECTION DE BEATS (Beat Cut) -> export CSV de marqueurs
+# 2. DÉTECTION DE BEATS (Beat Cut) -> export CSV
 # ------------------------------------------------------------------
 def detect_beats(input_path, output_csv, sensitivity=1.5, log=print):
-    """Détection d'impacts par flux d'énergie (numpy pur, hors ligne)."""
     cmd = [FFMPEG, "-i", input_path, "-vn", "-ac", "1", "-ar", "22050",
            "-f", "s16le", "pipe:1"]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -102,7 +154,7 @@ def detect_beats(input_path, output_csv, sensitivity=1.5, log=print):
     le = np.log10(e + 1e-10)
     onset = np.maximum(np.diff(le, prepend=le[0]), 0)
     thr = np.median(onset) + sensitivity * np.std(onset)
-    min_gap = int(0.25 * sr / hop)  # 4 beats/sec max
+    min_gap = int(0.25 * sr / hop)
     beats, last = [], -min_gap
     for i in np.where(onset > thr)[0]:
         if i - last >= min_gap:
@@ -117,33 +169,30 @@ def detect_beats(input_path, output_csv, sensitivity=1.5, log=print):
     return beats
 
 # ------------------------------------------------------------------
-# 3. AMÉLIORATION DE LA VOIX (filtres broadcast)
+# 3. AMÉLIORATION DE LA VOIX
 # ------------------------------------------------------------------
 def enhance_voice(input_path, output_path, log=print):
     af = ("highpass=f=70,lowpass=f=13000,afftdn=nf=-25,"
           "acompressor=threshold=0.35:ratio=3:attack=8:release=120:makeup=2,"
           "loudnorm=I=-16:TP=-1.5:LRA=11")
-    cmd = [FFMPEG, "-y", "-i", input_path, "-af", af,
-           "-c:v", "copy", output_path]
+    cmd = [FFMPEG, "-y", "-i", input_path, "-af", af, "-c:v", "copy", output_path]
     log("  Traitement vocal : dé-bruitage, compression, normalisation...")
     rc, err = _run(cmd, capture=True)
     log("  OK → " + output_path if rc == 0 else "! Erreur : " + err[-400:])
 
 # ------------------------------------------------------------------
-# 4. ACCÉLÉRATION PITCH-PRÉSERVÉE (atempo)
+# 4. ACCÉLÉRATION PITCH-PRÉSERVÉE
 # ------------------------------------------------------------------
 def speed_up(input_path, output_path, factor=1.5, log=print):
     factor = min(max(factor, 0.5), 4.0)
-    at = []
-    f = factor
+    at, f = [], factor
     while f > 2.0:
         at.append("atempo=2.0"); f /= 2.0
     while f < 0.5:
         at.append("atempo=0.5"); f /= 0.5
     at.append(f"atempo={f:.3f}")
-    vf = f"setpts=PTS/{factor:.3f}"
     cmd = [FFMPEG, "-y", "-i", input_path, "-filter_complex",
-           f"[0:v]{vf}[v];[0:a]{','.join(at)}[a]",
+           f"[0:v]setpts=PTS/{factor:.3f}[v];[0:a]{','.join(at)}[a]",
            "-map", "[v]", "-map", "[a]",
            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
            "-c:a", "aac", "-b:a", "192k", output_path]

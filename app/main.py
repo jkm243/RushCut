@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""RushCut — Interface graphique (Tkinter, 100% hors ligne)."""
+"""RushCut — Interface graphique (Tkinter, 100% hors ligne, auto-installation ffmpeg)."""
 import os, sys, threading, tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -12,7 +12,7 @@ class RushCut(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("RUSHCUT — Montage local")
-        self.geometry("520x640")
+        self.geometry("520x660")
         self.configure(bg=BG)
         self.file = tk.StringVar()
         self.opt_silence = tk.BooleanVar(value=True)
@@ -27,6 +27,10 @@ class RushCut(tk.Tk):
                  font=("Segoe UI", 22, "bold")).pack(pady=(14, 0))
         tk.Label(self, text="Montage express · 100% hors ligne",
                  bg=BG, fg=TXT, font=f).pack()
+
+        self.status = tk.Label(self, text="⏳ Vérification de ffmpeg...",
+                               bg=BG, fg="#ffd166", font=f)
+        self.status.pack(pady=(8, 0))
 
         box = tk.Frame(self, bg=PANEL, padx=16, pady=14)
         box.pack(fill="x", padx=16, pady=12)
@@ -50,30 +54,44 @@ class RushCut(tk.Tk):
 
         row = tk.Frame(self, bg=BG)
         row.pack(fill="x", padx=24, pady=6)
-        tk.Label(row, text="Seuil silences (dB) :", bg=BG, fg=TXT,
-                 font=f).pack(side="left")
+        tk.Label(row, text="Seuil silences (dB) :", bg=BG, fg=TXT, font=f).pack(side="left")
         tk.Entry(row, textvariable=self.thresh, width=6, bg=PANEL, fg=TXT,
-                 insertbackground=TXT, relief="flat",
-                 font=f).pack(side="left", padx=6)
+                 insertbackground=TXT, relief="flat", font=f).pack(side="left", padx=6)
         tk.Label(row, text="Vitesse x", bg=BG, fg=TXT, font=f).pack(side="left")
         tk.Entry(row, textvariable=self.speed_val, width=5, bg=PANEL, fg=TXT,
-                 insertbackground=TXT, relief="flat",
-                 font=f).pack(side="left", padx=6)
+                 insertbackground=TXT, relief="flat", font=f).pack(side="left", padx=6)
 
-        tk.Button(self, text="▶  LANCER LE TRAITEMENT", command=self.run,
+        self.run_btn = tk.Button(self, text="▶  LANCER LE TRAITEMENT", command=self.run,
                   bg=GREEN, fg="#04140b", font=("Segoe UI", 11, "bold"),
-                  relief="flat", height=2).pack(fill="x", padx=24, pady=10)
+                  relief="flat", height=2, state="disabled")
+        self.run_btn.pack(fill="x", padx=24, pady=10)
 
         self.bar = ttk.Progressbar(self, mode="indeterminate")
         self.bar.pack(fill="x", padx=24)
         self.logw = tk.Text(self, bg=PANEL, fg=GREEN, height=12,
                             insertbackground=GREEN, relief="flat", font=("Consolas", 9))
         self.logw.pack(fill="both", expand=True, padx=16, pady=12)
-        self.log("RushCut prêt. Importez un fichier pour commencer.")
+        self.log("RushCut démarre...")
+
+        # Installation automatique de ffmpeg en arrière-plan
+        threading.Thread(target=self._setup, daemon=True).start()
 
     def log(self, m):
         self.logw.insert("end", m + "\n")
         self.logw.see("end")
+
+    def _setup(self):
+        """Trouve ou installe ffmpeg automatiquement au 1er lancement."""
+        try:
+            core.ensure_ffmpeg(log=self.log)
+            self.status.config(text="✔ Prêt — ffmpeg installé et opérationnel",
+                               fg=GREEN)
+        except Exception as ex:
+            self.status.config(text="✘ ffmpeg introuvable", fg=RED)
+            self.log("! " + str(ex))
+            messagebox.showerror("RushCut — ffmpeg requis", str(ex))
+            return
+        self.run_btn.config(state="normal")
 
     def pick(self):
         p = filedialog.askopenfilename(filetypes=[
@@ -89,8 +107,8 @@ class RushCut(tk.Tk):
         outdir = filedialog.askdirectory(title="Dossier de sortie")
         if not outdir:
             return
-        threading.Thread(target=self._process,
-                         args=(src, outdir), daemon=True).start()
+        threading.Thread(target=self._process, args=(src, outdir),
+                         daemon=True).start()
 
     def _process(self, src, outdir):
         self.bar.start(10)
@@ -109,8 +127,8 @@ class RushCut(tk.Tk):
                 cur = os.path.join(outdir, name + "_voice.mp4")
             if self.opt_speed.get():
                 self.log("— Accélération —")
-                core.speed_up(cur, os.path.join(outdir, name + "_x" +
-                                 str(self.speed_val.get()).replace(".", "p") + ".mp4"),
+                tag = str(self.speed_val.get()).replace(".", "p")
+                core.speed_up(cur, os.path.join(outdir, name + "_x" + tag + ".mp4"),
                               self.speed_val.get(), log=self.log)
             if self.opt_beats.get():
                 self.log("— Beat Cut —")
@@ -119,6 +137,7 @@ class RushCut(tk.Tk):
             self.log("✔ Terminé !")
         except Exception as ex:
             self.log("! Erreur : " + str(ex))
+            messagebox.showerror("RushCut", str(ex))
         finally:
             self.bar.stop()
 
